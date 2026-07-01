@@ -1,0 +1,29 @@
+services:
+  bob:
+    build:
+      context: .
+      args:
+        # Pin the Bob Shell version for reproducible builds.
+        BOB_VERSION: "1.0.5"
+    image: bob-harness
+    container_name: bob-harness
+    env_file:
+      - .env
+    environment:
+      BOB_MODE: unrestricted-dev
+      BOB_WORKDIR: /workspace
+    ports:
+      - "8080:8080"
+    volumes:
+      # Files Bob creates/edits land here on the host (edits are scoped to the
+      # working dir by --yolo).
+      - ./workspace:/workspace
+    # Compose-level healthcheck: works under both docker and podman (podman
+    # ignores the image's HEALTHCHECK because it builds OCI-format images).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped

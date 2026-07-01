@@ -1,0 +1,13 @@
+# Secrets — never commit the real key
+.env
+
+# Bob working area
+workspace/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Claude Code local files
+.claude/
