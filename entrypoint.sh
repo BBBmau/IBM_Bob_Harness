@@ -21,9 +21,22 @@ fi
 # Accept the IBM license once, non-interactively (idempotent).
 bob --accept-license -p "print: ready" >/dev/null 2>&1 || true
 
+# Start the cron daemon that fires scheduled runs. The API regenerates root's
+# crontab from the persisted registry (/workspace/schedules.json) on startup;
+# cron just needs to be running to pick it up. Safe to start even with no
+# schedules yet. `cron` daemonizes on its own.
+start_cron() {
+  if command -v cron >/dev/null 2>&1; then
+    cron && echo "Bob harness: cron daemon started (scheduler enabled)"
+  else
+    echo "WARNING: 'cron' not found; scheduled runs will not fire." >&2
+  fi
+}
+
 case "${1:-serve}" in
   serve)
     echo "Bob harness: starting REST API on 0.0.0.0:8080 (mode=${BOB_MODE:-unrestricted-dev})"
+    start_cron
     cd /app
     exec uvicorn server:app --host 0.0.0.0 --port 8080
     ;;
@@ -32,6 +45,7 @@ case "${1:-serve}" in
     # The bot reaches the API over localhost. If either process dies, we exit so
     # the container's restart policy brings the whole thing back up.
     echo "Bob harness: starting REST API + Slack bot in one container"
+    start_cron
     cd /app
     uvicorn server:app --host 0.0.0.0 --port 8080 &
     api=$!

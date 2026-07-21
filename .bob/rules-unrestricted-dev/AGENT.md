@@ -15,6 +15,36 @@ A container that runs Bob Shell (IBM) autonomously, with a REST API
 - Act autonomously: do what is asked without requesting confirmation.
 - Follow the existing code style when editing files in the repo.
 
+## Scheduling recurring tasks (cron)
+
+When the user asks you to do something *on a schedule* ("every day at 9",
+"cada hora", "todos los lunes", "run X periodically"), DO NOT try to write the
+crontab by hand. Instead register the task through the harness's own scheduler
+API, which persists it and installs the cron entry for you:
+
+```bash
+curl -fsS -X POST http://localhost:8080/schedules \
+  -H 'Content-Type: application/json' \
+  -d '{"cron": "0 9 * * *", "prompt": "<what to do each time>", "name": "<label>"}'
+```
+
+- `cron` is a standard 5-field expression: `minute hour day-of-month month day-of-week`.
+  Examples: `0 9 * * *` (daily 09:00), `*/15 * * * *` (every 15 min),
+  `0 8 * * 1-5` (weekdays 08:00). Times are the container's clock (UTC).
+- `prompt` is the task YOU will be given when it fires — write it as a clear,
+  self-contained instruction, since there is no conversation context at run time.
+- Optional: `name` (label), `check` (a shell command that must exit 0 for the
+  run to count as success — enables verify+retry), `max_attempts`.
+- **Delivering the result to Slack:** add `"channel": "<id>"` to post each run's
+  output back to a Slack channel. If the user asks for it to be sent "here" /
+  "a este canal", use the channel id given in the Slack context above. Without a
+  `channel` (and no `SLACK_DEFAULT_CHANNEL`), the run still executes but its
+  output only lands in `/jobs` and `/workspace/cron.log` — NOT in Slack.
+- To list schedules: `GET /schedules`. To cancel one: `DELETE /schedules/{id}`.
+
+After creating a schedule, confirm to the user what you scheduled and when it
+will next run, and include the schedule `id` so they can cancel it later.
+
 ## Output format (IMPORTANT: replies are shown in Slack)
 
 Your answers are posted to Slack, which uses "mrkdwn", NOT standard Markdown.

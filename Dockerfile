@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         bash \
         git \
+        cron \
         python3 \
         python3-pip \
         python3-venv \

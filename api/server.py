@@ -20,6 +20,11 @@ Endpoints:
   GET  /jobs/{id}           -> status + output (+ attempts for /run)
   GET  /jobs/{id}/stream    -> Server-Sent Events, streaming output live
   POST /stream              -> start a job AND stream it in one request (SSE)
+  POST /schedules           -> register a recurring run (cron) -> schedule
+  GET  /schedules           -> list schedules
+  GET  /schedules/{id}      -> one schedule
+  DELETE /schedules/{id}    -> remove a schedule
+  POST /schedules/{id}/run  -> fire a schedule now (curled by cron on each tick)
 """
 from __future__ import annotations
 
@@ -30,19 +35,33 @@ import subprocess
 import threading
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="IBM Bob Shell REST Harness", version="1.2.0")
+import schedules
+
+
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    # Regenerate root's crontab from the persisted registry when the API boots,
+    # so schedules created before a restart are re-armed.
+    schedules.sync()
+    yield
+
+
+app = FastAPI(title="IBM Bob Shell REST Harness", version="1.3.0", lifespan=_lifespan)
 
 # Defaults come from the container env (see Dockerfile / .env).
 DEFAULT_MODE = os.environ.get("BOB_MODE", "unrestricted-dev")
 DEFAULT_WORKDIR = os.environ.get("BOB_WORKDIR", "/")
 BOB_BIN = os.environ.get("BOB_BIN", "bob")
 MAX_JOBS = int(os.environ.get("BOB_MAX_JOBS", "100"))
+# Fallback Slack channel for scheduled runs that don't specify one.
+DEFAULT_SLACK_CHANNEL = os.environ.get("SLACK_DEFAULT_CHANNEL")
 
 
 # --------------------------------------------------------------------------- #
@@ -77,6 +96,20 @@ class InvokeResponse(BaseModel):
 class RunRef(BaseModel):
     id: str
     status: str
+
+
+class ScheduleRequest(BaseModel):
+    cron: str = Field(..., description="5-field cron expression: m h dom mon dow.")
+    prompt: str = Field(..., description="The task Bob runs each time it fires.")
+    name: Optional[str] = Field(None, description="Human-readable label.")
+    mode: Optional[str] = Field(None, description="Custom mode slug (--chat-mode).")
+    check: Optional[str] = Field(None, description="Verify command (exit 0 = pass).")
+    workdir: Optional[str] = Field(None, description="Working directory for the run.")
+    channel: Optional[str] = Field(
+        None, description="Slack channel id to post the result to (falls back to "
+        "SLACK_DEFAULT_CHANNEL). Empty = don't post to Slack.")
+    max_attempts: int = Field(3, ge=1, le=10, description="Max verify/retry attempts.")
+    timeout: int = Field(600, ge=1, le=3600, description="Max seconds per Bob attempt.")
 
 
 # --------------------------------------------------------------------------- #
@@ -414,6 +447,94 @@ def start_and_stream(req: InvokeRequest) -> StreamingResponse:
     mode, workdir = _resolve(req)
     job = _spawn(Job(_bob_cmd(req.prompt, mode, req.yolo), workdir, req.timeout))
     return StreamingResponse(_sse(job), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------- #
+# Schedules — recurring runs fired by the container's cron daemon
+# --------------------------------------------------------------------------- #
+@app.post("/schedules", status_code=201)
+def create_schedule(req: ScheduleRequest) -> dict:
+    """Register a recurring task. Persists it and (re)installs root's crontab."""
+    try:
+        return schedules.add(
+            cron=req.cron,
+            prompt=req.prompt,
+            name=req.name,
+            mode=req.mode,
+            check=req.check,
+            workdir=req.workdir,
+            channel=req.channel,
+            max_attempts=req.max_attempts,
+            timeout=req.timeout,
+        )
+    except schedules.ScheduleError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/schedules")
+def list_schedules() -> dict:
+    return {"schedules": schedules.load()}
+
+
+@app.get("/schedules/{schedule_id}")
+def get_schedule(schedule_id: str) -> dict:
+    sched = schedules.get(schedule_id)
+    if sched is None:
+        raise HTTPException(status_code=404, detail="schedule not found")
+    return sched
+
+
+@app.delete("/schedules/{schedule_id}")
+def delete_schedule(schedule_id: str) -> dict:
+    if not schedules.remove(schedule_id):
+        raise HTTPException(status_code=404, detail="schedule not found")
+    return {"deleted": schedule_id}
+
+
+@app.post("/schedules/{schedule_id}/run", response_model=RunRef, status_code=202)
+def run_schedule(schedule_id: str) -> RunRef:
+    """Fire a schedule now. This is the endpoint cron curls on each tick."""
+    _require_key()
+    sched = schedules.get(schedule_id)
+    if sched is None:
+        raise HTTPException(status_code=404, detail="schedule not found")
+
+    req = RunRequest(
+        prompt=sched["prompt"],
+        mode=sched.get("mode"),
+        check=sched.get("check"),
+        workdir=sched.get("workdir"),
+        max_attempts=sched.get("max_attempts", 3),
+        timeout=sched.get("timeout", 600),
+    )
+    mode, workdir = _resolve(req)
+    run = _spawn(HarnessRun(req, mode, workdir))
+    schedules.mark_run(schedule_id, run_id=run.id, status="started")
+    channel = sched.get("channel") or DEFAULT_SLACK_CHANNEL
+
+    # When the run finishes: record its status and (optionally) post the result
+    # to Slack. Runs off-thread so the HTTP response returns immediately.
+    def _record() -> None:
+        run.done.wait()
+        schedules.mark_run(schedule_id, run_id=run.id, status=run.status)
+        if channel:
+            _deliver_to_slack(sched, run, channel)
+
+    threading.Thread(target=_record, daemon=True).start()
+    return RunRef(id=run.id, status=run.status)
+
+
+def _deliver_to_slack(sched: dict, run: "HarnessRun", channel: str) -> None:
+    """Post a finished scheduled run's cleaned output to a Slack channel."""
+    import slack_bot
+
+    label = sched.get("name") or sched["id"]
+    answer = slack_bot.clean_output(run.output) or "(no output)"
+    if run.status != "completed":
+        answer = f":warning: scheduled run `{label}` ended with status *{run.status}*\n\n{answer}"
+    ok, err = slack_bot.post_message(channel, slack_bot.build_reply(answer))
+    if not ok:
+        print(f"[scheduler] failed to post schedule {sched['id']} to {channel}: {err}")
 
 
 def _bob_available() -> bool:

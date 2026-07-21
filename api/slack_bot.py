@@ -232,17 +232,27 @@ _ANSWER_GUIDANCE = (
 )
 
 
-def build_conversation_prompt(transcript: str, text: str) -> str:
+def build_conversation_prompt(
+    transcript: str, text: str, channel_id: Optional[str] = None
+) -> str:
     """Build Bob's prompt: answer guidance + optional thread context + message.
 
     With no prior history it's the guidance plus the message. With history, Bob
     is also given the conversation so it can answer with continuity (files it
-    created, prior decisions, language, etc.).
+    created, prior decisions, language, etc.). `channel_id`, when given, is
+    surfaced so Bob can target *this* channel when scheduling recurring tasks.
     """
+    ctx = _ANSWER_GUIDANCE
+    if channel_id:
+        ctx += (
+            f"\n\nSlack context: this conversation is in channel `{channel_id}`. "
+            "If the user asks to schedule a recurring task that should post its "
+            'results back here, set the schedule\'s "channel" to this id.'
+        )
     if not transcript.strip():
-        return f"{_ANSWER_GUIDANCE}\n\n{text}"
+        return f"{ctx}\n\n{text}"
     return (
-        f"{_ANSWER_GUIDANCE}\n\n"
+        f"{ctx}\n\n"
         "You are continuing a Slack conversation. Here is the conversation so "
         "far (oldest first):\n\n"
         f"{transcript}\n\n"
@@ -250,6 +260,47 @@ def build_conversation_prompt(transcript: str, text: str) -> str:
         "(files you already created, prior decisions, and the user's language):\n\n"
         f"User: {text}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Outbound posting (used by the scheduler to deliver run results to a channel)
+# --------------------------------------------------------------------------- #
+def post_message(
+    channel: str,
+    text: str,
+    *,
+    token: Optional[str] = None,
+    thread_ts: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Post `text` to a Slack `channel` via the Web API (chat.postMessage).
+
+    Uses the bot token (arg or ``SLACK_BOT_TOKEN`` env). This is a thin urllib
+    call — no slack_bolt needed — so the API process can deliver scheduled run
+    results without holding a Socket Mode connection. Returns (ok, error).
+    """
+    token = token or os.environ.get("SLACK_BOT_TOKEN")
+    if not token:
+        return False, "SLACK_BOT_TOKEN not set"
+    if not channel:
+        return False, "no channel"
+    payload: dict = {"channel": channel, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    req = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, str(exc)
+    return bool(body.get("ok")), body.get("error", "")
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +356,7 @@ def create_app():
         # once Bob is done — same felt experience, only chat:write needed.
         placeholder = say(text=THINKING_TEXT, thread_ts=thread_ts)
 
-        prompt = build_conversation_prompt(transcript, event["text"])
+        prompt = build_conversation_prompt(transcript, event["text"], channel_id=channel)
         result = run_prompt(prompt, harness_url=harness_url, mode=mode, workdir=workdir, timeout=timeout)
         reply = build_reply(result)
         try:
