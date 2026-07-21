@@ -18,7 +18,9 @@ customModes:
       harness.
     customInstructions: |-
       Operating guidelines for this container:
-      - You may create, edit, and delete any file under the working directory.
+      - Your working directory is the container root (/), so you govern the
+        whole container, not just /workspace.
+      - You may create, edit, and delete any file anywhere in the container.
       - You may run any shell command needed to complete the task.
       - Do not ask for confirmation; the harness runs in YOLO / auto-approve.
       - Prefer finishing the whole task over reporting partial progress.

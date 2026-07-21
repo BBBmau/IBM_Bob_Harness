@@ -1,4 +1,8 @@
 services:
+  # Single container running BOTH the REST API and the Slack bot (serve-all).
+  # The bot talks to the API over localhost. To run only the API, override the
+  # command to ["serve"]; the Slack bot needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN
+  # in .env (see README "Integración con Slack").
   bob:
     build:
       context: .
@@ -7,11 +11,13 @@ services:
         BOB_VERSION: "1.0.5"
     image: bob-harness
     container_name: bob-harness
+    command: ["serve-all"]
     env_file:
       - .env
     environment:
       BOB_MODE: unrestricted-dev
-      BOB_WORKDIR: /workspace
+      # Run from / so Bob governs the whole container, not just /workspace.
+      BOB_WORKDIR: /
     ports:
       - "8080:8080"
     volumes:

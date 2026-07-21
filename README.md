@@ -1,8 +1,9 @@
 # IBM Bob Harness
 
 A Docker container that runs **Bob Shell** (IBM) autonomously, with a
-**custom unrestricted mode**, a **REST API** to consume it programmatically, and
-an **orchestration loop** that verifies results and retries until they pass.
+**custom unrestricted mode**, a **REST API** to consume it programmatically, an
+**orchestration loop** that verifies results and retries until they pass, and a
+**bidirectional Slack bot**.
 
 > Bob Shell has **no** native server mode. This project wraps its headless
 > `bob -p "<prompt>" --yolo --chat-mode=unrestricted-dev` invocation and adds a
@@ -13,13 +14,40 @@ an **orchestration loop** that verifies results and retries until they pass.
 | File | Role |
 |---|---|
 | `Dockerfile` | Ubuntu 24.04 + Node 22 + pinned Bob Shell + REST wrapper + `HEALTHCHECK` |
-| `docker-compose.yml` | Orchestration: port 8080, `workspace/` volume, `.env`, healthcheck |
-| `entrypoint.sh` | Validates the env, accepts the license, starts the API or the CLI |
+| `docker-compose.yml` | Orchestration: single container (`serve-all` = API + Slack bot), port 8080, `workspace/` volume, `.env`, healthcheck |
+| `entrypoint.sh` | Validates the env, accepts the license, starts the API / bot / CLI |
 | `.bob/custom_modes.yaml` | `unrestricted-dev` mode: full access (read/edit/command/browser/mcp) |
+| `.bob/rules-unrestricted-dev/AGENT.md` | Persistent context/rules for the mode (loaded by Bob at runtime) |
 | `api/server.py` | FastAPI app that shells out to `bob` (invoke / jobs / run / stream) |
-| `api/test_server.py` | Unit tests (mock `subprocess`, offline) |
+| `api/slack_bot.py` | Bidirectional Slack bot (Socket Mode) that forwards messages to `/invoke` |
+| `slack/manifest.yaml` | Slack App manifest (scopes + `message.channels` + Socket Mode) |
+| `api/test_server.py` / `test_slack_bot.py` | Unit tests (mock `subprocess`/network, offline) |
 | `api/requirements.txt` / `requirements-dev.txt` | Runtime / test dependencies |
-| `.env` | Holds `BOBSHELL_API_KEY` (**gitignored, never committed**) |
+| `.env` | Holds `BOBSHELL_API_KEY` + Slack tokens (**gitignored, never committed**) |
+
+### Where the `.bob` config lives
+
+There is a single source of truth for Bob's config — the `.bob/` directory in
+this repo:
+
+```
+.bob/
+├── custom_modes.yaml              # the unrestricted-dev mode ("settings")
+└── rules-unrestricted-dev/
+    └── AGENT.md                   # persistent context/rules for that mode
+```
+
+The `Dockerfile` copies it verbatim to the **container root**: `/.bob/`. Bob runs
+with its working directory set to `/` (see `BOB_WORKDIR` below), so `/.bob/` is
+the **project-level** config for the *whole* container — that's why Bob governs
+the entire filesystem, not just `/workspace`. This has been verified end to end:
+Bob reads `/.bob/rules-unrestricted-dev/AGENT.md` at runtime.
+
+> **Not the same as `/root/.bob/`.** At startup Bob auto-creates its own
+> runtime state under `/root/.bob/` (`settings.json` with the license/auth,
+> `installation_id`, `trustedFolders.json`, `tmp/`). That directory is managed
+> by Bob itself and holds **none** of our config — edit `.bob/` in the repo, not
+> `/root/.bob/`. To pick up changes, rebuild the image.
 
 ## Endpoints at a glance
 
@@ -92,7 +120,7 @@ curl http://localhost:8080/health
   "status": "ok",
   "bob_present": true,
   "default_mode": "unrestricted-dev",
-  "default_workdir": "/workspace",
+  "default_workdir": "/",
   "api_key_set": true
 }
 ```
@@ -101,7 +129,8 @@ curl http://localhost:8080/health
 
 Runs one Bob prompt and returns the combined output. Runs in YOLO +
 `unrestricted-dev` by default, so Bob can create, edit, and execute files
-inside `/workspace` without asking for confirmation.
+anywhere in the container (the default `workdir` is `/`) without asking for
+confirmation.
 
 **Request body**
 
@@ -110,7 +139,7 @@ inside `/workspace` without asking for confirmation.
 | `prompt` | string | (required) | The task for Bob |
 | `yolo` | bool | `true` | Auto-approve all tool calls |
 | `mode` | string | `unrestricted-dev` | Custom mode slug (`--chat-mode`) |
-| `workdir` | string | `/workspace` | Working directory for the run |
+| `workdir` | string | `/` | Working directory for the run (`/` = whole container) |
 | `timeout` | int | `600` | Max seconds before abort (1–3600) |
 
 **Example — curl**
@@ -133,7 +162,9 @@ curl -s http://localhost:8080/invoke \
 }
 ```
 
-Any file Bob creates/edits shows up in `./workspace` on the host.
+Bob works from `/` by default, so it can touch the whole container. Only files
+written under `/workspace` show up in `./workspace` on the host (it's the mounted
+volume); edits elsewhere are ephemeral and vanish when the container is recreated.
 
 **Example — Python**
 
@@ -272,7 +303,69 @@ FastAPI ships OpenAPI docs out of the box:
 
 ---
 
-## 4. Use Bob directly (without the API)
+## 4. Talk to Bob from Slack (bidirectional bot)
+
+The Slack bot lets you talk to Bob **in a Slack channel without @-mentioning
+it**: write a message, Bob runs it through `POST /invoke` and replies in the
+thread.
+
+It connects to Slack over **Socket Mode** (an outbound WebSocket), so the
+container needs **no public URL**. By default the compose command is
+`serve-all`, which runs the REST API **and** the Slack bot in the **same
+container** — the bot calls the API over `http://localhost:8080`. (You can still
+run them apart: override the command to `serve` for API-only, or `slack` for a
+bot-only container that points at a remote API via `HARNESS_URL`.)
+
+### 4.1 Create the Slack App
+
+1. Go to **[api.slack.com/apps](https://api.slack.com/apps)** → **Create New App**
+   → **From a manifest**, pick your workspace, and paste `slack/manifest.yaml`
+   from this repo. It pre-configures the scopes (`chat:write`,
+   `channels:history`), the `message.channels` event, and Socket Mode.
+2. **Install** the app to the workspace, then copy the **Bot User OAuth Token**
+   (`xoxb-...`) → `SLACK_BOT_TOKEN`.
+3. Under **Basic Information → App-Level Tokens**, generate a token with the
+   `connections:write` scope and copy it (`xapp-...`) → `SLACK_APP_TOKEN`.
+4. **Invite the bot to your channel:** `/invite @Bob`.
+
+### 4.2 Configure and run
+
+Paste the two tokens into `.env` (see `.env.example`), then:
+
+```bash
+docker compose up --build   # single container: REST API + Slack bot (serve-all)
+docker compose logs -f bob  # watch the bot connect and handle messages
+```
+
+Now any message in a channel the bot is in (no mention needed) gets a reply
+from Bob in-thread. To limit the bot to specific channels, set
+`SLACK_ALLOWED_CHANNELS` to a comma-separated list of channel IDs.
+
+### 4.3 How it works / notes
+
+- The bot ignores messages from bots (including its own) — this is what prevents
+  a reply loop — and skips message edits/joins (`subtype`) and empty messages.
+- It calls `/invoke` (synchronous prompt → reply); the verify/retry `/run` loop
+  is not used for chat.
+- The bot pulls prior thread messages back as context, so Bob answers with
+  continuity within a thread.
+- Very long transcripts are truncated in the reply; re-run in a terminal for the
+  full log.
+- **Security:** the bot runs Bob in `unrestricted-dev` + YOLO. Anyone who can
+  post in a channel the bot is in can run commands inside the container — only
+  add it to trusted channels (and use `SLACK_ALLOWED_CHANNELS`).
+
+| Env var | Default | Description |
+|---|---|---|
+| `SLACK_BOT_TOKEN` | — | **Required.** Bot token (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | — | **Required.** App-level token for Socket Mode (`xapp-...`) |
+| `HARNESS_URL` | `http://localhost:8080` | REST API base URL (same container under `serve-all`; override for a remote API) |
+| `SLACK_ALLOWED_CHANNELS` | — | Optional CSV of channel IDs to restrict to |
+| `BOB_INVOKE_TIMEOUT` | `600` | Max seconds per Bob invocation |
+
+---
+
+## 5. Use Bob directly (without the API)
 
 ```bash
 # Interactive session
@@ -282,12 +375,14 @@ docker compose run --rm bob shell
 docker compose run --rm bob bob -p "Explain @README.md" --yolo --chat-mode=unrestricted-dev
 ```
 
-## 5. Tests
+## 6. Tests
 
-Unit tests live in `api/test_server.py`. They mock `subprocess`, so they never
-call the real `bob` binary or the IBM API — fast and offline. They cover
-`/health`, `/invoke`, the async `/jobs` lifecycle, `/stream` (SSE), and the
-`/run` orchestration loop (verify + retry). Current suite: **20 tests**.
+Unit tests live in `api/test_server.py` (REST API) and `api/test_slack_bot.py`
+(Slack bot logic). They mock `subprocess` and the network, so they never call
+the real `bob` binary, the IBM API, or Slack — fast and offline. They cover
+`/health`, `/invoke`, the async `/jobs` lifecycle, `/stream` (SSE), the `/run`
+orchestration loop (verify + retry), and the bot's `should_handle` / `run_prompt`
+/ `build_reply` helpers.
 
 Run them inside the built image (which already has the runtime deps):
 
@@ -304,24 +399,31 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-## 6. Configuration reference
+## 7. Configuration reference
 
 | Env var | Default | Where | Description |
 |---|---|---|---|
 | `BOBSHELL_API_KEY` | — | `.env` | **Required.** Authenticates Bob in headless mode |
 | `BOB_MODE` | `unrestricted-dev` | `.env` / compose | Default custom mode slug |
-| `BOB_WORKDIR` | `/workspace` | `.env` / compose | Default working directory |
+| `BOB_WORKDIR` | `/` | `.env` / compose | Default working directory (`/` = whole container) |
 | `BOB_MAX_JOBS` | `100` | env | Max runs kept in memory (oldest evicted) |
 | `BOB_BIN` | `bob` | env | Path/name of the Bob binary |
 | `BOB_VERSION` | `1.0.5` | build arg | Pinned Bob Shell version |
+| `SLACK_BOT_TOKEN` | — | `.env` | Slack bot token (`xoxb-...`); required for the Slack bot |
+| `SLACK_APP_TOKEN` | — | `.env` | Slack app-level token (`xapp-...`) for Socket Mode |
+| `SLACK_ALLOWED_CHANNELS` | — | `.env` | Optional CSV of channel IDs the bot answers in |
+| `HARNESS_URL` | `http://localhost:8080` | compose | REST API URL the Slack bot calls (same container under `serve-all`) |
 
-## 7. Security
+## 8. Security
 
 - The `unrestricted-dev` mode grants **full** access to the container's
   filesystem and shell. Use it only inside this disposable container.
-- `--yolo` limits edits to the starting directory (`/workspace`).
-- `BOBSHELL_API_KEY` is a secret: it lives in `.env` (gitignored). Do not
-  publish it, and rotate it if it leaks.
+- `--yolo` limits edits to the starting directory, which here is `/` — i.e. the
+  **whole container**. Keep this container disposable and never mount anything
+  sensitive from the host.
+- Secrets (`BOBSHELL_API_KEY`, the Slack tokens) live only in `.env`
+  (gitignored) — the committed files carry placeholders. Do not publish them,
+  and rotate any that leak.
 - The REST API has **no authentication** yet — do not expose port 8080 beyond
   localhost until a token layer is added.
 
