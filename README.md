@@ -1,5 +1,7 @@
 # IBM Bob Harness
 
+![Bob Harness](https://media2.giphy.com/media/v1.Y2lkPTc5MGI3NjExendtcTVyMmRhejk3MngzNTMxdnk1NWxkd3dhcnJzYnFhb3N3enl4dSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/V5Zao1FEKouvd4p2Wd/giphy.gif)
+
 A Docker container that runs **Bob Shell** (IBM) autonomously, with a
 **custom unrestricted mode**, a **REST API** to consume it programmatically, an
 **orchestration loop** that verifies results and retries until they pass, and a

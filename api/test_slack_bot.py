@@ -184,6 +184,22 @@ def test_looks_like_code_detects_and_rejects():
     assert not slack_bot.looks_like_code("Hola, ¿en qué te ayudo hoy?")
 
 
+def test_build_reply_bulleted_list_stays_plain():
+    # A prose message with a "- " bullet list must NOT be wrapped in a code
+    # block (a "- " prefix is a bullet marker, not a diff line).
+    msg = (
+        "I have full access to:\n"
+        "- The entire container filesystem\n"
+        "- Shell command execution\n"
+        "- File operations (read, write, edit)\n"
+        "- Code analysis and development tools\n\n"
+        "What would you like me to work on?"
+    )
+    reply = slack_bot.build_reply(msg)
+    assert not reply.startswith("```")
+    assert reply == msg
+
+
 def test_build_reply_truncates_long_output():
     reply = slack_bot.build_reply("a" * (slack_bot.MAX_REPLY_CHARS + 500))
     assert "output truncated" in reply

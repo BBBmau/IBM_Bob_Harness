@@ -159,10 +159,13 @@ def clean_output(raw: str) -> str:
 
 # Unambiguous "this is code/patch" signals: diff/patch headers and shebangs.
 _CODE_STRONG_RE = re.compile(r"^(---|\+\+\+|@@|diff --git|Index:|#!)")
-# Weaker per-line code signals; used with a majority vote.
+# Weaker per-line code signals; used with a majority vote. NOTE: we deliberately
+# do NOT treat a leading "- " / "+ " as a code signal — those are far more often
+# Markdown/plain bullet markers (which Slack renders fine as a normal message)
+# than diff lines. Real diffs are caught by _CODE_STRONG_RE (---, +++, @@, ...).
 _CODE_WEAK_RE = re.compile(
     r"^(\s{2,}|\t|def |class |import |from \S+ import |function |const |let |var |"
-    r"public |private |#include|<\?php|package |func |return |[{}();]|[+-]\s)"
+    r"public |private |#include|<\?php|package |func |return |[{}();])"
 )
 
 
