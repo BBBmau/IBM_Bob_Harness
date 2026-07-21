@@ -65,6 +65,48 @@ Bob reads `/.bob/rules-unrestricted-dev/AGENT.md` at runtime.
 
 ---
 
+## How to start (quickstart)
+
+Get the container up in three steps. Requires Docker (or Podman) installed.
+
+```bash
+# 1. Configure secrets: copy the template and fill in your keys.
+cp .env.example .env
+#    - Paste your Bob API key into BOBSHELL_API_KEY (see §1 to create one).
+#    - (Optional, for Slack) paste SLACK_BOT_TOKEN + SLACK_APP_TOKEN (see §4).
+
+# 2. Build the image and start the container (REST API + Slack bot).
+docker compose up --build
+#    Add -d to run it detached in the background:
+#    docker compose up --build -d
+
+# 3. Check it's alive.
+curl http://localhost:8080/health
+```
+
+The API is now at **`http://localhost:8080`** (Swagger UI at `/docs`). If you set
+the Slack tokens, the bot connects automatically and replies in any channel it's
+invited to.
+
+**Managing the container**
+
+```bash
+docker compose logs -f bob   # follow logs (watch the API + Slack bot start up)
+docker compose ps            # show status / health
+docker compose down          # stop and remove the container
+docker compose restart bob   # restart after changing .env
+docker compose up --build    # rebuild after editing code or .bob/ config
+```
+
+> **API only (no Slack)?** Override the command to skip the bot:
+> `docker compose run --rm --service-ports bob serve`
+> (or change `command: ["serve-all"]` to `["serve"]` in `docker-compose.yml`).
+
+> Using Podman instead of Docker? Replace `docker` with `podman` in every
+> command above — see the note under §2.
+
+---
+
 ## 1. Configure the API key
 
 ### Get a Bob API key
