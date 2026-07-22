@@ -62,6 +62,8 @@ def test_crontab_body_renders_lines_and_curl():
     assert "# [abc123] nightly" in body
     assert "0 0 * * * curl -fsS -X POST" in body
     assert "/schedules/abc123/run" in body
+    # Each acknowledgment ends with a newline so the log stays line-delimited.
+    assert "; echo >>" in body
     assert body.endswith("\n")
 
 
@@ -108,6 +110,31 @@ def test_mark_run_records_last_status(registry):
     assert got["last_run_id"] == "deadbeef"
     assert got["last_status"] == "completed"
     assert got["last_run"] is not None
+
+
+def test_log_outcome_appends_final_status(tmp_path, monkeypatch):
+    import json
+
+    log = tmp_path / "cron.log"
+    monkeypatch.setattr(schedules, "CRON_LOG", str(log))
+    schedules.log_outcome(
+        "abc123", run_id="deadbeef", status="failed", name="nightly"
+    )
+    lines = log.read_text().splitlines()
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["event"] == "outcome"
+    assert entry["schedule_id"] == "abc123"
+    assert entry["run_id"] == "deadbeef"
+    assert entry["status"] == "failed"
+    assert entry["name"] == "nightly"
+    assert entry["ts"]
+
+
+def test_log_outcome_never_raises_on_unwritable_log(monkeypatch):
+    # A bad path must not crash the recording thread.
+    monkeypatch.setattr(schedules, "CRON_LOG", "/nonexistent-dir/cron.log")
+    schedules.log_outcome("x", run_id="y", status="completed")  # no raise
 
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +187,29 @@ def test_run_schedule_triggers_a_run(client):
 def test_run_missing_schedule_returns_404(client):
     r = client.post("/schedules/nope/run")
     assert r.status_code == 404
+
+
+def test_run_schedule_logs_final_outcome(client, tmp_path, monkeypatch):
+    import json
+
+    log = tmp_path / "cron.log"
+    monkeypatch.setattr(schedules, "CRON_LOG", str(log))
+    sid = client.post("/schedules", json={"cron": "0 9 * * *", "prompt": "hi"}).json()["id"]
+
+    with patch.object(server, "_stream_exec", return_value=("ok", 0, False)):
+        run_id = client.post(f"/schedules/{sid}/run").json()["id"]
+        server._get(run_id).done.wait(timeout=5)
+        # _record runs off-thread after done — give it a beat to write the log.
+        for _ in range(50):
+            if log.exists() and log.read_text().strip():
+                break
+            time.sleep(0.05)
+
+    entry = json.loads(log.read_text().splitlines()[-1])
+    assert entry["event"] == "outcome"
+    assert entry["schedule_id"] == sid
+    assert entry["run_id"] == run_id
+    assert entry["status"] == "completed"
 
 
 def test_create_schedule_with_channel(client):

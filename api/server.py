@@ -517,6 +517,12 @@ def run_schedule(schedule_id: str) -> RunRef:
     def _record() -> None:
         run.done.wait()
         schedules.mark_run(schedule_id, run_id=run.id, status=run.status)
+        # Write the real terminal status to the cron log. The line cron itself
+        # appended only captured the "running" acknowledgment; this makes the
+        # log reflect completed/failed/timeout so failures are visible there.
+        schedules.log_outcome(
+            schedule_id, run_id=run.id, status=run.status, name=sched.get("name")
+        )
         if channel:
             _deliver_to_slack(sched, run, channel)
 
