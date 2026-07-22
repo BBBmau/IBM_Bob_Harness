@@ -40,7 +40,7 @@ app = FastAPI(title="IBM Bob Shell REST Harness", version="1.2.0")
 
 # Defaults come from the container env (see Dockerfile / .env).
 DEFAULT_MODE = os.environ.get("BOB_MODE", "unrestricted-dev")
-DEFAULT_WORKDIR = os.environ.get("BOB_WORKDIR", "/workspace")
+DEFAULT_WORKDIR = os.environ.get("BOB_WORKDIR", "/")
 BOB_BIN = os.environ.get("BOB_BIN", "bob")
 MAX_JOBS = int(os.environ.get("BOB_MAX_JOBS", "100"))
 

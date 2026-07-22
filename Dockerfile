@@ -7,7 +7,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # Candidate install locations for the `bob` binary + a place for our API.
     PATH="/root/.local/bin:/root/.bob/bin:/usr/local/bin:/usr/bin:${PATH}" \
     BOB_MODE=unrestricted-dev \
-    BOB_WORKDIR=/workspace
+    # Bob runs from the container root so it governs the WHOLE container.
+    BOB_WORKDIR=/
 
 # System deps: curl + certs for the installer, bash for the install script,
 # git for repo work inside the container, python for the REST wrapper.
@@ -38,8 +39,13 @@ RUN npm install -g --loglevel=error \
         "https://s3.us-south.cloud-object-storage.appdomain.cloud/bob-shell/bobshell-${BOB_VERSION}.tgz" \
     && bob --version
 
-# Custom "unrestricted" mode: full read/edit/command access in the container.
-COPY .bob/custom_modes.yaml /root/.bob/custom_modes.yaml
+# Bob config lives in ONE place: the container root /.bob (project-level config
+# for the whole container, since Bob runs with cwd=/). It holds custom_modes.yaml
+# (the "settings") + rules-unrestricted-dev/ (the AGENT.md rules).
+# Note: Bob still auto-creates its own runtime state under /root/.bob at startup
+# (settings.json license/auth, installation_id, trustedFolders.json, tmp/) — that
+# dir is managed by Bob itself, not by us.
+COPY .bob/ /.bob/
 
 # REST API wrapper around `bob -p`.
 WORKDIR /app
@@ -49,9 +55,10 @@ COPY api/ /app/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Bob edits are scoped to the starting dir (--yolo), so we run from /workspace.
+# Bob edits are scoped to the starting dir (--yolo). We run from / so Bob can
+# reach the whole container; /workspace remains as the compose volume mount.
 RUN mkdir -p /workspace
-WORKDIR /workspace
+WORKDIR /
 
 EXPOSE 8080
 
