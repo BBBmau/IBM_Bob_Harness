@@ -24,6 +24,7 @@ A Docker container that runs **Bob Shell** (IBM) autonomously, with a
 | `.bob/rules-unrestricted-dev/AGENT.md` | Persistent context/rules for the mode (loaded by Bob at runtime) |
 | `api/server.py` | FastAPI app that shells out to `bob` (invoke / jobs / run / stream) |
 | `api/slack_bot.py` | Bidirectional Slack bot (Socket Mode) that forwards messages to `/invoke` |
+| `api/schedules.py` | Cron scheduler: persisted registry + root crontab generation |
 | `slack/manifest.yaml` | Slack App manifest (scopes + `message.channels` + Socket Mode) |
 | `api/test_server.py` / `test_slack_bot.py` | Unit tests (mock `subprocess`/network, offline) |
 | `api/requirements.txt` / `requirements-dev.txt` | Runtime / test dependencies |
@@ -65,6 +66,11 @@ Bob reads `/.bob/rules-unrestricted-dev/AGENT.md` at runtime.
 | `GET` | `/jobs/{id}` | Status + output (+ `attempts` for `/run`) |
 | `GET` | `/jobs/{id}/stream` | Stream a run's output live (SSE) |
 | `POST` | `/stream` | Start a job **and** stream it in one request (SSE) |
+| `POST` | `/schedules` | Register a recurring run (cron) → `{schedule}` |
+| `GET` | `/schedules` | List schedules |
+| `GET` | `/schedules/{id}` | One schedule (+ last run info) |
+| `DELETE` | `/schedules/{id}` | Remove a schedule |
+| `POST` | `/schedules/{id}/run` | Fire a schedule now (curled by cron each tick) |
 | `GET` | `/docs` | Swagger UI (auto-generated) |
 
 ---
@@ -411,7 +417,97 @@ from Bob in-thread. To limit the bot to specific channels, set
 
 ---
 
-## 5. Use Bob directly (without the API)
+## 5. Schedule recurring tasks (cron)
+
+Bob is **stateless** — each `bob -p` is a one-shot process — so recurring work
+needs a scheduler that *fires* Bob on a clock. That scheduler is the container's
+own **cron daemon**, managed through the harness API (no hand-editing crontabs).
+
+How it fits together:
+
+- The **source of truth** is a JSON registry persisted on the mounted volume
+  (`/workspace/schedules.json`), so schedules **survive container recreation**.
+- Root's crontab is **regenerated from that registry** on every change and on
+  API startup — never edited by hand.
+- Each schedule fires by curling the harness's own `POST /schedules/{id}/run`,
+  which runs the stored prompt through the `/run` (verify+retry) machinery. So
+  **cron needs none of Bob's environment**, and every scheduled run shows up in
+  `/jobs` and `/workspace/cron.log`.
+
+### Create / list / cancel via the API
+
+```bash
+# Create: run a prompt every weekday at 09:00 (container clock = UTC).
+curl -s -X POST http://localhost:8080/schedules \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "cron": "0 9 * * 1-5",
+        "prompt": "Summarize any new files under /workspace and write a report.md",
+        "name": "weekday-summary"
+      }'
+# -> {"id":"a1b2c3d4e5f6","cron":"0 9 * * 1-5", ... }
+
+curl -s http://localhost:8080/schedules            # list all
+curl -s http://localhost:8080/schedules/a1b2c3d4e5f6   # one (incl. last_run/last_status)
+curl -s -X DELETE http://localhost:8080/schedules/a1b2c3d4e5f6   # cancel
+```
+
+**Request body**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `cron` | string | (required) | 5-field expression: `m h dom mon dow` (e.g. `*/15 * * * *`) |
+| `prompt` | string | (required) | Task Bob runs each time it fires (self-contained — no chat context) |
+| `name` | string | `""` | Human-readable label |
+| `mode` | string | `unrestricted-dev` | Custom mode slug |
+| `check` | string | `null` | Verify command (exit 0 = pass) → enables verify/retry |
+| `channel` | string | `null` | Slack channel id to post the result to (falls back to `SLACK_DEFAULT_CHANNEL`) |
+| `max_attempts` | int | `3` | Max verify/retry attempts |
+| `timeout` | int | `600` | Max seconds per Bob attempt |
+
+### Deliver the result to Slack
+
+By default a scheduled run's output lands only in `/jobs` and
+`/workspace/cron.log`. To have it **posted to a Slack channel** when it
+finishes, add a `channel` (or set a `SLACK_DEFAULT_CHANNEL` in `.env`):
+
+```bash
+curl -s -X POST http://localhost:8080/schedules \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "cron": "*/5 * * * *",
+        "prompt": "Tell a short, original joke.",
+        "name": "joke-o-clock",
+        "channel": "C0123ABC456"
+      }'
+```
+
+Now every 5 minutes Bob posts a fresh joke to that channel. The harness uses the
+same `SLACK_BOT_TOKEN` as the bot (`chat:write`), so the bot must be a member of
+the target channel (`/invite @Bob`). Find a channel id in Slack via *View channel
+details* (bottom of the panel) or right-click → *Copy link* (the `C...` id is at
+the end of the URL). From Slack you can just ask Bob "post it here" — it's given
+the current channel id and will set `channel` for you.
+
+### Create from Slack
+
+Just ask Bob in natural language — it's taught (via `.bob/rules-unrestricted-dev/AGENT.md`)
+to register schedules through this API:
+
+> **you:** cada día a las 8am revisa el estado del repo y publícalo aquí
+> **Bob:** _Listo — programé `daily-repo-status` (`0 8 * * *`), id `a1b2c3d4e5f6`. Próxima ejecución mañana 08:00 UTC._
+
+### Notes
+
+- Times use the **container clock (UTC)**. Convert from your local time.
+- Cron expressions accept `*`, ranges (`1-5`), lists (`0,30`), and steps
+  (`*/15`). Named values (`@daily`, `mon`) are **not** supported — use numbers.
+- **Security:** scheduled runs execute Bob in `unrestricted-dev` + YOLO with no
+  human in the loop. Only schedule prompts you fully trust.
+
+---
+
+## 6. Use Bob directly (without the API)
 
 ```bash
 # Interactive session
@@ -421,14 +517,15 @@ docker compose run --rm bob shell
 docker compose run --rm bob bob -p "Explain @README.md" --yolo --chat-mode=unrestricted-dev
 ```
 
-## 6. Tests
+## 7. Tests
 
-Unit tests live in `api/test_server.py` (REST API) and `api/test_slack_bot.py`
-(Slack bot logic). They mock `subprocess` and the network, so they never call
-the real `bob` binary, the IBM API, or Slack — fast and offline. They cover
-`/health`, `/invoke`, the async `/jobs` lifecycle, `/stream` (SSE), the `/run`
-orchestration loop (verify + retry), and the bot's `should_handle` / `run_prompt`
-/ `build_reply` helpers.
+Unit tests live in `api/test_server.py` (REST API), `api/test_slack_bot.py`
+(Slack bot logic), and `api/test_schedules.py` (cron scheduler). They mock
+`subprocess`, `crontab`, and the network, so they never call the real `bob`
+binary, the IBM API, cron, or Slack — fast and offline. They cover `/health`,
+`/invoke`, the async `/jobs` lifecycle, `/stream` (SSE), the `/run` orchestration
+loop (verify + retry), the bot's `should_handle` / `run_prompt` / `build_reply`
+helpers, and the scheduler's cron validation / crontab generation / CRUD.
 
 Run them inside the built image (which already has the runtime deps):
 
@@ -445,7 +542,7 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-## 7. Configuration reference
+## 8. Configuration reference
 
 | Env var | Default | Where | Description |
 |---|---|---|---|
@@ -458,9 +555,12 @@ pytest -v
 | `SLACK_BOT_TOKEN` | — | `.env` | Slack bot token (`xoxb-...`); required for the Slack bot |
 | `SLACK_APP_TOKEN` | — | `.env` | Slack app-level token (`xapp-...`) for Socket Mode |
 | `SLACK_ALLOWED_CHANNELS` | — | `.env` | Optional CSV of channel IDs the bot answers in |
-| `HARNESS_URL` | `http://localhost:8080` | compose | REST API URL the Slack bot calls (same container under `serve-all`) |
+| `SLACK_DEFAULT_CHANNEL` | — | `.env` | Fallback channel id where scheduled runs post their result |
+| `HARNESS_URL` | `http://localhost:8080` | compose | REST API URL the Slack bot + cron call (same container under `serve-all`) |
+| `BOB_SCHEDULES_FILE` | `/workspace/schedules.json` | env | Persisted schedule registry (survives restarts) |
+| `BOB_CRON_LOG` | `/workspace/cron.log` | env | Where each cron tick logs its curl output |
 
-## 8. Security
+## 9. Security
 
 - The `unrestricted-dev` mode grants **full** access to the container's
   filesystem and shell. Use it only inside this disposable container.

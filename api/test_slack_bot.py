@@ -207,6 +207,48 @@ def test_build_reply_truncates_long_output():
 
 
 # --------------------------------------------------------------------------- #
+# post_message (outbound, used by the scheduler)
+# --------------------------------------------------------------------------- #
+def test_post_message_ok(monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"ok": True}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["body"] = json.loads(req.data.decode())
+        captured["auth"] = req.headers.get("Authorization")
+        return _Resp()
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        ok, err = slack_bot.post_message("C123", "hola")
+    assert ok and err == ""
+    assert captured["url"].endswith("/api/chat.postMessage")
+    assert captured["body"]["channel"] == "C123" and captured["body"]["text"] == "hola"
+    assert captured["auth"] == "Bearer xoxb-test"
+
+
+def test_post_message_requires_token(monkeypatch):
+    monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+    ok, err = slack_bot.post_message("C123", "hola")
+    assert not ok and "SLACK_BOT_TOKEN" in err
+
+
+def test_build_conversation_prompt_includes_channel():
+    p = slack_bot.build_conversation_prompt("", "hola", channel_id="C999")
+    assert "C999" in p
+
+
+# --------------------------------------------------------------------------- #
 # Thread context: format_thread / build_conversation_prompt
 # --------------------------------------------------------------------------- #
 def test_format_thread_labels_roles_and_skips_noise():
