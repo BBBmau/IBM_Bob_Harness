@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import threading
 import uuid
@@ -170,6 +171,13 @@ def _stream_exec(sink: BaseRun, cmd: list[str], cwd: str, timeout: int) -> tuple
 
     Returns (output, returncode, timed_out). A watchdog kills the process if it
     overruns `timeout`, so the deadline is real even if the child keeps writing.
+
+    The child starts in its own session (``start_new_session=True``) so the
+    watchdog can SIGKILL the whole process *group* — not just the direct child.
+    If we killed only the direct PID, any grandchild that inherited the stdout
+    pipe would keep it open, the ``for line in proc.stdout`` loop below would
+    never see EOF, and the run would hang forever in "running" instead of
+    reaching a terminal "timeout" state.
     """
     try:
         proc = subprocess.Popen(
@@ -180,6 +188,7 @@ def _stream_exec(sink: BaseRun, cmd: list[str], cwd: str, timeout: int) -> tuple
             text=True,
             bufsize=1,
             env=dict(os.environ),
+            start_new_session=True,
         )
     except FileNotFoundError:
         msg = f"'{cmd[0]}' not found on PATH\n"
@@ -190,7 +199,15 @@ def _stream_exec(sink: BaseRun, cmd: list[str], cwd: str, timeout: int) -> tuple
 
     def _kill() -> None:
         killed["v"] = True
-        proc.kill()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            # Group already gone, or we can't signal it: at least kill the
+            # direct child so we don't leave the watchdog a no-op.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
     timer = threading.Timer(timeout, _kill)
     timer.start()
@@ -517,6 +534,12 @@ def run_schedule(schedule_id: str) -> RunRef:
     def _record() -> None:
         run.done.wait()
         schedules.mark_run(schedule_id, run_id=run.id, status=run.status)
+        # Write the real terminal status to the cron log. The line cron itself
+        # appended only captured the "running" acknowledgment; this makes the
+        # log reflect completed/failed/timeout so failures are visible there.
+        schedules.log_outcome(
+            schedule_id, run_id=run.id, status=run.status, name=sched.get("name")
+        )
         if channel:
             _deliver_to_slack(sched, run, channel)
 

@@ -97,10 +97,13 @@ def _cron_line(sched: dict) -> str:
     """The crontab line that fires one schedule by curling its /run endpoint."""
     url = f"{HARNESS_URL.rstrip('/')}/schedules/{sched['id']}/run"
     # -fsS: fail on HTTP errors, silent progress, but still show errors. The
-    # output is appended to CRON_LOG so a failing job leaves a trail.
+    # output is appended to CRON_LOG so a failing job leaves a trail. The
+    # trailing `echo` puts each acknowledgment on its own line (curl emits no
+    # newline), keeping the log newline-delimited alongside the final-status
+    # entries written by log_outcome().
     return (
         f"{sched['cron']} curl -fsS -X POST {url} "
-        f">> {CRON_LOG} 2>&1"
+        f">> {CRON_LOG} 2>&1; echo >> {CRON_LOG}"
     )
 
 
@@ -229,3 +232,32 @@ def mark_run(schedule_id: str, *, run_id: str, status: str) -> None:
                 s["last_status"] = status
                 _write(schedules)
                 return
+
+
+def log_outcome(
+    schedule_id: str, *, run_id: str, status: str, name: Optional[str] = None
+) -> None:
+    """Append the FINAL status of a scheduled run to the cron log.
+
+    The crontab line only captures the immediate HTTP 202 acknowledgment, whose
+    body is always ``{"status": "running"}`` because the run is still starting
+    when the endpoint returns. That makes the raw log misleading — every line
+    reads "running" even for jobs that long since finished. This records the
+    real terminal state (completed/failed/timeout) once the run is done, as a
+    newline-delimited JSON entry, so the log is actually useful for spotting
+    failures. Best-effort: never raises if the log is unwritable.
+    """
+    entry = {
+        "ts": _now(),
+        "event": "outcome",
+        "schedule_id": schedule_id,
+        "run_id": run_id,
+        "status": status,
+    }
+    if name:
+        entry["name"] = name
+    try:
+        with open(CRON_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass

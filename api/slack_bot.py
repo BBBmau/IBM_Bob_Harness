@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -49,8 +50,38 @@ MAX_REPLY_CHARS = 3500
 # answer. attempt_completion wraps the final answer between these markers.
 _OUTPUT_MARKER = "---output---"
 
-# Placeholder posted while Bob works; also skipped when rebuilding thread context.
-THINKING_TEXT = "_Bob is thinking…_"
+# Placeholders rotated in place while Bob works, so a long run visibly keeps
+# "loading" instead of sitting on one static line that reads as stuck. The first
+# entry is what we post immediately; a background thread cycles through the rest.
+THINKING_PHRASES = [
+    "_Bob is thinking…_",
+    "_Bob is working on it…_",
+    "_Still crunching…_",
+    "_Hang tight, this one's bigger…_",
+    "_Bob is still on it…_",
+    "_Almost there…_",
+]
+# Back-compat: the initial placeholder and the historical single-phrase value.
+THINKING_TEXT = THINKING_PHRASES[0]
+
+# Seconds between placeholder edits. A run shorter than this never gets rotated
+# (no flicker); a max-length 600s run is ~120 edits of one message — comfortably
+# within chat.update rate limits for a single channel.
+THINKING_INTERVAL = int(os.environ.get("SLACK_THINKING_INTERVAL", "5"))
+
+
+def thinking_phrase(tick: int) -> str:
+    """Return the placeholder text for animation step `tick` (round-robin)."""
+    return THINKING_PHRASES[tick % len(THINKING_PHRASES)]
+
+
+def is_thinking_text(text: str) -> bool:
+    """True if `text` is one of our placeholder phrases (any rotation step).
+
+    Used to skip an in-flight placeholder when rebuilding thread context, so a
+    concurrent run's rotating message never leaks into Bob's prompt.
+    """
+    return (text or "").strip() in THINKING_PHRASES
 
 # Thread-context limits: how many prior messages to feed back, and a per-message
 # cap so one huge paste can't blow up the prompt.
@@ -212,7 +243,7 @@ def format_thread(messages: list[dict], current_ts: Optional[str] = None) -> str
         if msg.get("subtype"):  # joins, topic changes, etc.
             continue
         text = (msg.get("text") or "").strip()
-        if not text or text == THINKING_TEXT:
+        if not text or is_thinking_text(text):
             continue
         role = "Assistant" if msg.get("bot_id") else "User"
         if len(text) > MAX_HISTORY_MSG_CHARS:
@@ -313,6 +344,23 @@ def _parse_allowed(raw: Optional[str]) -> Optional[set[str]]:
     return channels or None
 
 
+def _animate_thinking(client, channel, ts, stop, interval, logger) -> None:
+    """Rotate the placeholder text every `interval`s until `stop` is set.
+
+    Runs on a daemon thread while the handler blocks on run_prompt(). Sleeps
+    first (via stop.wait), so a run shorter than `interval` gets no edit at all
+    — no flicker. Best-effort: a failed chat_update (rate limit, transient) is
+    logged and the loop continues; it never raises.
+    """
+    tick = 1
+    while not stop.wait(interval):
+        try:
+            client.chat_update(channel=channel, ts=ts, text=thinking_phrase(tick))
+        except Exception as exc:  # noqa: BLE001 - keep animating on any API hiccup
+            logger.warning("thinking animation update failed: %s", exc)
+        tick += 1
+
+
 def create_app():
     """Build and return a configured slack_bolt App (imported lazily)."""
     from slack_bolt import App
@@ -353,11 +401,27 @@ def create_app():
 
         # There is no native "typing…" indicator for channel bots (the old RTM
         # user_typing API is gone), so we post a placeholder and edit it in place
-        # once Bob is done — same felt experience, only chat:write needed.
-        placeholder = say(text=THINKING_TEXT, thread_ts=thread_ts)
+        # once Bob is done — same felt experience, only chat:write needed. While
+        # Bob works (run_prompt blocks), a background thread rotates the
+        # placeholder text so a long run visibly keeps loading instead of
+        # looking stuck. We stop and join it BEFORE the final edit so the answer
+        # always wins the race with the animator.
+        placeholder = say(text=THINKING_PHRASES[0], thread_ts=thread_ts)
+        stop = threading.Event()
+        animator = threading.Thread(
+            target=_animate_thinking,
+            args=(client, channel, placeholder["ts"], stop, THINKING_INTERVAL, logger),
+            daemon=True,
+        )
+        animator.start()
 
         prompt = build_conversation_prompt(transcript, event["text"], channel_id=channel)
-        result = run_prompt(prompt, harness_url=harness_url, mode=mode, workdir=workdir, timeout=timeout)
+        try:
+            result = run_prompt(prompt, harness_url=harness_url, mode=mode, workdir=workdir, timeout=timeout)
+        finally:
+            stop.set()
+            animator.join(timeout=THINKING_INTERVAL + 1)
+
         reply = build_reply(result)
         try:
             client.chat_update(channel=channel, ts=placeholder["ts"], text=reply)
