@@ -5,6 +5,9 @@ is mocked, so they run fast and offline (same discipline as test_server.py).
 """
 import io
 import json
+import logging
+import threading
+import time
 import urllib.error
 from unittest.mock import patch
 
@@ -256,6 +259,7 @@ def test_format_thread_labels_roles_and_skips_noise():
         {"ts": "1", "text": "crea un hello world", "user": "U1"},
         {"ts": "2", "text": "hecho", "bot_id": "B1"},
         {"ts": "3", "text": slack_bot.THINKING_TEXT, "bot_id": "B1"},  # placeholder
+        {"ts": "3b", "text": slack_bot.THINKING_PHRASES[1], "bot_id": "B1"},  # rotated placeholder
         {"ts": "4", "subtype": "channel_join", "text": "joined"},       # noise
         {"ts": "5", "text": "donde quedó?", "user": "U1"},              # current msg
     ]
@@ -281,3 +285,77 @@ def test_build_conversation_prompt_with_history_wraps_context():
     assert "conversation so far" in prompt
     assert "User: hi" in prompt and "Assistant: hello" in prompt
     assert prompt.strip().endswith("User: y ahora?")
+
+
+# --------------------------------------------------------------------------- #
+# Thinking-placeholder animation: thinking_phrase / is_thinking_text / rotator
+# --------------------------------------------------------------------------- #
+def test_thinking_phrase_round_robin():
+    n = len(slack_bot.THINKING_PHRASES)
+    assert n >= 2
+    assert slack_bot.thinking_phrase(0) == slack_bot.THINKING_PHRASES[0]
+    assert slack_bot.thinking_phrase(1) == slack_bot.THINKING_PHRASES[1]
+    assert slack_bot.thinking_phrase(n) == slack_bot.THINKING_PHRASES[0]  # wraps around
+    assert slack_bot.thinking_phrase(0) != slack_bot.thinking_phrase(1)
+
+
+def test_is_thinking_text():
+    for phrase in slack_bot.THINKING_PHRASES:
+        assert slack_bot.is_thinking_text(phrase)
+    assert slack_bot.is_thinking_text(slack_bot.THINKING_TEXT)
+    # Surrounding whitespace is ignored.
+    assert slack_bot.is_thinking_text(f"  {slack_bot.THINKING_PHRASES[0]}  ")
+    assert not slack_bot.is_thinking_text("Listo, creé el archivo.")
+    assert not slack_bot.is_thinking_text("")
+
+
+class _RecordingClient:
+    """Fake Slack client that records chat_update text (optionally raising)."""
+
+    def __init__(self, raise_always: bool = False):
+        self.texts: list[str] = []
+        self._raise = raise_always
+
+    def chat_update(self, channel, ts, text):
+        self.texts.append(text)
+        if self._raise:
+            raise RuntimeError("rate limited")
+
+
+def _run_animator(client, interval=0.01, alive=0.06):
+    stop = threading.Event()
+    t = threading.Thread(
+        target=slack_bot._animate_thinking,
+        args=(client, "C1", "123.45", stop, interval, logging.getLogger("test")),
+        daemon=True,
+    )
+    t.start()
+    time.sleep(alive)  # let a few ticks fire
+    stop.set()
+    t.join(timeout=1)
+    return t
+
+
+def test_animate_thinking_rotates_until_stopped():
+    client = _RecordingClient()
+    t = _run_animator(client)
+    assert not t.is_alive()  # exits promptly once stop is set
+    assert len(client.texts) >= 1
+    assert all(slack_bot.is_thinking_text(txt) for txt in client.texts)
+    if len(client.texts) >= 2:  # consecutive ticks rotate to different phrases
+        assert client.texts[0] != client.texts[1]
+
+
+def test_animate_thinking_does_not_fire_for_fast_runs():
+    # Interval longer than the window => run finished before the first edit.
+    client = _RecordingClient()
+    t = _run_animator(client, interval=5, alive=0.02)
+    assert not t.is_alive()
+    assert client.texts == []  # no flicker for quick answers
+
+
+def test_animate_thinking_survives_update_errors():
+    client = _RecordingClient(raise_always=True)
+    t = _run_animator(client)
+    assert not t.is_alive()      # kept animating despite errors, then exited cleanly
+    assert len(client.texts) >= 1
