@@ -4,6 +4,7 @@ These tests never call the real `bob` binary or the IBM API: `subprocess.run`
 and `os.makedirs` are mocked, so they run fast and offline.
 """
 import subprocess
+import time
 from unittest.mock import patch
 
 import pytest
@@ -217,6 +218,37 @@ def test_job_bob_not_found(client):
 
 def test_get_unknown_job_returns_404(client):
     assert client.get("/jobs/deadbeef").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Timeout watchdog kills the whole process tree (no hung jobs)
+# --------------------------------------------------------------------------- #
+def test_job_starts_child_in_own_session(client):
+    # start_new_session=True is what lets the watchdog SIGKILL the process
+    # group instead of just the direct child.
+    fake = FakePopen(["hi\n"], returncode=0)
+    with patch.object(server.os, "makedirs"), patch.object(
+        server.subprocess, "Popen", return_value=fake
+    ) as popen:
+        jid = client.post("/jobs", json={"prompt": "x"}).json()["id"]
+        _wait_done(jid)
+    assert popen.call_args.kwargs["start_new_session"] is True
+
+
+def test_stream_exec_kills_process_tree_on_timeout():
+    # A grandchild (`sleep 30`) inherits the stdout pipe. Killing only the
+    # direct child (bash) would leave the pipe open and block the read loop for
+    # ~30s. Killing the process group unblocks it, so this returns promptly.
+    sink = server.Job(["true"], "/", 1)
+    start = time.monotonic()
+    _out, rc, timed_out = server._stream_exec(
+        sink, ["bash", "-c", "sleep 30 & wait"], cwd="/", timeout=0.5
+    )
+    elapsed = time.monotonic() - start
+
+    assert timed_out is True
+    assert rc is None
+    assert elapsed < 10, f"read loop blocked on the grandchild ({elapsed:.1f}s)"
 
 
 def test_stream_emits_data_and_done_events(client):
