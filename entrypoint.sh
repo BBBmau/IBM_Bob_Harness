@@ -46,15 +46,17 @@ case "${1:-serve}" in
     # If either token is absent, we fall back to API-only mode so the container
     # starts successfully without Slack credentials.
     if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_APP_TOKEN:-}" ]; then
+      SLACK_ENABLED=true
       echo "Bob harness: starting REST API + Slack bot in one container"
     else
+      SLACK_ENABLED=false
       echo "Bob harness: SLACK_BOT_TOKEN / SLACK_APP_TOKEN not set — starting REST API only (Slack bot disabled)"
     fi
     start_cron
     cd /app
     uvicorn server:app --host 0.0.0.0 --port 8080 &
     api=$!
-    if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_APP_TOKEN:-}" ]; then
+    if [ "$SLACK_ENABLED" = true ]; then
       # Wait for the API to answer before starting the bot (avoids early errors).
       for _ in $(seq 1 30); do
         curl -fsS http://localhost:8080/health >/dev/null 2>&1 && break
@@ -68,6 +70,7 @@ case "${1:-serve}" in
       exit "$ec"
     else
       wait "$api"
+      exit $?
     fi
     ;;
   slack)
