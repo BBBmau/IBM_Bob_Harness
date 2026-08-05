@@ -1,17 +1,18 @@
 services:
-  # Single container running BOTH the REST API and the Slack bot (serve-all).
-  # The bot talks to the API over localhost. To run only the API, override the
-  # command to ["serve"]; the Slack bot needs SLACK_BOT_TOKEN + SLACK_APP_TOKEN
-  # in .env (see README "Integración con Slack").
+  # REST API only — no Slack bot required.
+  # To also run the Slack bot, override the command to ["serve-all"] and
+  # supply SLACK_BOT_TOKEN + SLACK_APP_TOKEN in .env.
   bob:
     build:
       context: .
       args:
         # Pin the Bob Shell version for reproducible builds.
         BOB_VERSION: "1.0.5"
+        # Pin the Go version for reproducible builds.
+        GO_VERSION: "1.22.4"
     image: bob-harness
     container_name: bob-harness
-    command: ["serve-all"]
+    command: ["serve"]
     env_file:
       - .env
     environment:
