@@ -47,7 +47,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 # Go — required by both agents to run `make provider` and `go build ./...`.
 # Bump GO_VERSION to upgrade. Releases: https://go.dev/dl/
-ARG GO_VERSION=1.22.4
+ARG GO_VERSION=1.26.5
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
       | tar -C /usr/local -xz && \
     go version
