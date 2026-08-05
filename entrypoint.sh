@@ -6,6 +6,12 @@ set -euo pipefail
 # Ensure bob is reachable even in a non-login shell.
 export PATH="/root/.local/bin:/root/.bob/bin:/usr/local/bin:/usr/bin:${PATH}"
 
+# Wire GITHUB_TOKEN into git's HTTPS credential helper so git push/fetch
+# never prompts for a username/password inside the container.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  git config --global credential.helper "!f() { echo username=x-token; echo password=${GITHUB_TOKEN}; }; f"
+fi
+
 if [ -z "${BOBSHELL_API_KEY:-}" ]; then
   echo "ERROR: BOBSHELL_API_KEY is not set." >&2
   echo "       Pass it with:  docker run --env-file .env ...  (or -e BOBSHELL_API_KEY=...)" >&2
