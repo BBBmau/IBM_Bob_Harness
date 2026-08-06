@@ -12,6 +12,20 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
   git config --global credential.helper "!f() { echo username=x-token; echo password=${GITHUB_TOKEN}; }; f"
 fi
 
+# Set git commit author identity so commits are attributed to the real GitHub
+# account (required for CLA checks on upstream PRs).
+# GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL are injected via docker-compose env.
+# Falls back to the GitHub noreply address derived from GIT_AUTHOR_NAME when
+# GIT_AUTHOR_EMAIL is absent — GitHub accepts noreply addresses for CLA.
+if [ -n "${GIT_AUTHOR_NAME:-}" ]; then
+  git config --global user.name "${GIT_AUTHOR_NAME}"
+fi
+if [ -n "${GIT_AUTHOR_EMAIL:-}" ]; then
+  git config --global user.email "${GIT_AUTHOR_EMAIL}"
+elif [ -n "${GIT_AUTHOR_NAME:-}" ]; then
+  git config --global user.email "${GIT_AUTHOR_NAME}@users.noreply.github.com"
+fi
+
 if [ -z "${BOBSHELL_API_KEY:-}" ]; then
   echo "ERROR: BOBSHELL_API_KEY is not set." >&2
   echo "       Pass it with:  docker run --env-file .env ...  (or -e BOBSHELL_API_KEY=...)" >&2
